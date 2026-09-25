@@ -2123,7 +2123,8 @@ class TestMessageRouting:
 
 
     @pytest.mark.asyncio
-    async def test_message_edit_with_new_mention_processed(self, adapter):
+    @pytest.mark.parametrize("include_previous", [False, True])
+    async def test_message_edit_with_new_mention_processed(self, adapter, include_previous):
         """Editing @bot into a previously ignored MPIM message should route once."""
         original_event = {
             "text": "whats the rapchat summary for last 12 hours",
@@ -2150,12 +2151,45 @@ class TestMessageRouting:
                 "edited": {"user": "U_USER", "ts": "1234567899.000001"},
             },
         }
+        if include_previous:
+            edited_event["previous_message"] = original_event
         await adapter._handle_slack_message(edited_event)
 
         adapter.handle_message.assert_called_once()
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "whats the rapchat summary for last 12 hours"
         assert msg_event.message_id == "1234567890.000001"
+
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("change_kind", ["no_edit", "agent_session", "same_content", "same_edit"])
+    async def test_metadata_change_after_restart_does_not_replay_prompt(self, adapter, change_kind):
+        """Status/unfurl updates of old DM roots are not fresh user input."""
+        previous = {
+            "type": "message", "text": "Please summarize the report", "user": "U_USER",
+            "ts": "1234567890.000001",
+        }
+        updated = dict(previous, reply_count=2, latest_reply="1234567999.000001")
+        event = {
+            "type": "message", "subtype": "message_changed", "channel": "D123",
+            "channel_type": "im", "team": "T123", "event_ts": "1234568000.000001",
+            "message": updated,
+        }
+        if change_kind == "agent_session":
+            updated = dict(previous, agent_session={"status": "processing"}, subscribed=True)
+            event.update(message=updated, previous_message=previous)
+        if change_kind in {"same_content", "same_edit"}:
+            updated["edited"] = {"user": "U_USER", "ts": "1234567900.000001"}
+            event["previous_message"] = previous
+        if change_kind == "same_edit":
+            previous["edited"] = updated["edited"]
+            # A later automatic enrichment can also change the message representation.
+            updated["blocks"] = [{"type": "rich_text", "elements": []}]
+        assert not adapter._processed_message_ts
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -5653,7 +5687,7 @@ class TestAgentSessionsApiRouting:
         a._app.client.agents_sessions_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
-            status="is thinking...",
+            status="processing",
         )
         a._app.client.assistant_threads_setStatus.assert_not_called()
 
@@ -5670,9 +5704,75 @@ class TestAgentSessionsApiRouting:
         a._app.client.agents_sessions_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
-            status="",
+            status="active",
         )
         a._app.client.assistant_threads_setStatus.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("api_error", [None, "not_authorized"])
+    async def test_status_lifecycle_through_real_sdk(self, monkeypatch, api_error):
+        """SDK payloads must start and clear feedback, including legacy-capable bots."""
+        if _load_installed_package("slack_sdk") is None:
+            pytest.skip("slack-sdk is not installed")
+        sdk = pytest.importorskip("slack_sdk.web.async_client")
+        response_module = pytest.importorskip("slack_sdk.web.async_slack_response")
+        if not callable(getattr(sdk.AsyncWebClient, "agents_sessions_setStatus", None)):
+            pytest.skip("Agent Sessions requires slack-sdk 3.44+")
+        monkeypatch.setattr(_slack_mod, "_AGENT_SESSIONS_SUPPORTED", None)
+        client = sdk.AsyncWebClient(token="xoxb-test", retry_handlers=[])
+        requests = []
+
+        async def transport(http_verb, api_url, req_args):
+            method = api_url.rsplit("/", 1)[-1]
+            requests.append((method, req_args["json"]))
+            data = {"ok": True}
+            if method == "agents.sessions.setStatus" and api_error:
+                data = {"ok": False, "error": api_error}
+            return response_module.AsyncSlackResponse(
+                client=client, http_verb=http_verb, api_url=api_url,
+                req_args=req_args, data=data, headers={}, status_code=200,
+            ).validate()
+
+        monkeypatch.setattr(client, "_send", transport)
+        a = self._adapter()
+        a._app.client = client
+        a.set_status_text("C123", "is reading docs/api.md…")
+        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
+        expected = [
+            ("agents.sessions.setStatus", "processing"),
+            ("agents.sessions.setStatus", "active"),
+        ]
+        if api_error:
+            expected = [
+                ("agents.sessions.setStatus", "processing"),
+                ("assistant.threads.setStatus", "is reading docs/api.md…"),
+                ("agents.sessions.setStatus", "active"),
+                ("assistant.threads.setStatus", ""),
+            ]
+        assert requests == [
+            (method, {"channel_id": "C123", "thread_ts": "parent_ts", "status": status})
+            for method, status in expected
+        ]
+        assert not a._active_status_threads
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [
+        _StreamExpiredError("rate limited", {"error": "ratelimited"}),
+        _StreamExpiredError("bad payload", {"error": "invalid_arguments"}),
+        _StreamExpiredError("invalid token", {"error": "invalid_auth"}),
+        TimeoutError("not_authorized"),
+    ])
+    async def test_status_failure_does_not_retry_other_errors(self, error, caplog):
+        """Only a concrete capability refusal can justify a second API write."""
+        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
+        a = self._adapter()
+        a._app.client.agents_sessions_setStatus.side_effect = error
+        with caplog.at_level("DEBUG", logger=_slack_mod.__name__):
+            await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
+        a._app.client.agents_sessions_setStatus.assert_awaited_once()
+        a._app.client.assistant_threads_setStatus.assert_not_awaited()
+        assert "failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_thread_title_uses_agents_sessions_rename(self):
