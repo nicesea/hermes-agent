@@ -224,6 +224,8 @@ class TestTrustGateApprovalRouting:
         assert len(seen) == 1
         assert seen[0]["pattern_key"] == "mcp_elicitation"
         assert seen[0]["request_id"]
+        assert seen[0]["allow_permanent"] is False
+        assert seen[0]["allow_session"] is False
 
     @pytest.mark.parametrize("platform,cron,single_query", [
         ("webhook", "", False),

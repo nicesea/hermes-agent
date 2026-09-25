@@ -280,13 +280,25 @@ def _sdk_supports_agent_sessions() -> bool:
     return _AGENT_SESSIONS_SUPPORTED
 
 
-def _session_status_method(client: Any):
-    """Return the status setter: Agent Sessions API when available, else legacy."""
+async def _set_session_status(
+    client: Any, *, channel_id: str, thread_ts: str, status: str
+) -> None:
+    """Translate typing text to session lifecycle status, retaining legacy bot support."""
     if _sdk_supports_agent_sessions():
         method = getattr(client, "agents_sessions_setStatus", None)
         if method is not None:
-            return method
-    return client.assistant_threads_setStatus
+            try:
+                # Unlike assistant.threads, this API accepts lifecycle enums, not text.
+                await method(channel_id=channel_id, thread_ts=thread_ts,
+                             status="processing" if status else "active")
+                return
+            except Exception as exc:
+                # SDK support does not mean this app has Agent Sessions enabled.
+                # Existing chat:write bots may still use the legacy status endpoint.
+                if not _slack_error_is(exc, "not_authorized"):
+                    raise
+    await client.assistant_threads_setStatus(
+        channel_id=channel_id, thread_ts=thread_ts, status=status)
 
 
 def _session_title_method(client: Any):
@@ -1060,6 +1072,7 @@ class SlackAdapter(BasePlatformAdapter):
         # approval / clarify message_ts (or (team_id, ts)) → resolved; blocks double-clicks.
         # Bounded: never-clicked prompts would otherwise leak forever.
         self._approval_resolved: Dict[Any, bool] = {}
+        self._approval_requesters: Dict[Any, Tuple[str, str]] = {}
         self._clarify_resolved: Dict[Any, bool] = {}
         # clarify_id → (channel_id, message_ts, rendered_question) so the gateway can retire a
         # card whose clarify ended without a click (timeout, reset, superseding prose).
@@ -2615,12 +2628,13 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def _set_thread_status(
         self, chat_id: str, team_id: str, thread_ts: str, status: str, fail_label: str) -> None:
-        """``assistant.threads.setStatus`` (empty ``status`` clears); failures are debug-logged."""
+        """Set or clear typing feedback using the app's supported Slack API."""
         try:
-            _set_status = _session_status_method(self._get_client(chat_id, team_id=team_id))
-            await _set_status(channel_id=chat_id, thread_ts=thread_ts, status=status)
+            await _set_session_status(
+                self._get_client(chat_id, team_id=team_id),
+                channel_id=chat_id, thread_ts=thread_ts, status=status)
         except Exception as e:
-            logger.debug("[Slack] assistant.threads.setStatus %s: %s", fail_label, e)
+            logger.debug("[Slack] thread status %s: %s", fail_label, e)
 
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
@@ -4074,7 +4088,7 @@ class SlackAdapter(BasePlatformAdapter):
 
     def _normalize_changed_message(self, event: dict) -> Optional[dict]:
         """Turn a ``message_changed`` envelope into a plain message event.
-        None if malformed or the original was already routed to the agent. The edit's own ts rides
+        Ignore metadata-only changes and already-routed messages. The edit's own ts rides
         along as ``_slack_changed_event_ts`` for dedup."""
         updated_message = event.get("message")
         if not isinstance(updated_message, dict):
@@ -4084,6 +4098,17 @@ class SlackAdapter(BasePlatformAdapter):
             return None
         edited = updated_message.get("edited")
         edited_ts = str(edited.get("ts") or "") if isinstance(edited, dict) else ""
+        # Status, unfurl, and locale updates also emit message_changed. They must not
+        # replay old prompts when a restart has emptied the in-memory processed cache.
+        if not edited_ts:
+            return None
+        previous_message = event.get("previous_message")
+        if isinstance(previous_message, dict):
+            if previous_message.get("edited") == edited or all(
+                previous_message.get(key) == updated_message.get(key)
+                for key in ("text", "blocks", "files")
+            ):
+                return None
         outer_event_ts = str(event.get("ts") or "")
         changed_event_ts = (
             str(event.get("event_ts") or edited_ts or "")
@@ -4804,6 +4829,10 @@ class SlackAdapter(BasePlatformAdapter):
     async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
         """Block Kit approval prompt; the buttons call ``resolve_gateway_approval()`` to unblock the
         waiting agent thread — same mechanism as the text ``/approve`` flow."""
+        requester_team = self._metadata_team_id(prompt.metadata)
+        requester_user = str((prompt.metadata or {}).get("user_id") or "")
+        if self.config.extra.get("approval_requester_only") and not (requester_team and requester_user):
+            return SendResult(success=False, error="Missing approval requester identity")
 
         def _build() -> Tuple[str, list]:
             actions = [
@@ -4814,9 +4843,14 @@ class SlackAdapter(BasePlatformAdapter):
                 {"type": "actions", "elements": actions}]
             return f"⚠️ Command approval required: {prompt.command[:100]}", blocks
 
-        return await self._send_interactive_prompt(
+        result = await self._send_interactive_prompt(
             prompt.chat_id, prompt.metadata, _build, "send_exec_approval",
             resolved=self._approval_resolved, resolved_max=self._APPROVAL_RESOLVED_MAX)
+        if result.success and result.message_id and requester_team and requester_user:
+            marker = self._workspace_message_marker(requester_team, result.message_id)
+            self._approval_requesters[marker] = (requester_team, requester_user)
+            self._trim_oldest_dict_entries(self._approval_requesters, self._APPROVAL_RESOLVED_MAX)
+        return result
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
@@ -5457,8 +5491,14 @@ class SlackAdapter(BasePlatformAdapter):
         approval_key = self._workspace_message_marker(team_id, msg_ts)
         if msg_ts in self._approval_resolved:
             approval_key = msg_ts
+        if self.config.extra.get("approval_requester_only") and (
+            self._approval_requesters.get(approval_key) != (team_id, user_id)
+        ):
+            logger.warning("[Slack] Approval click by a non-requester was ignored")
+            return
         if self._approval_resolved.pop(approval_key, True):
             return
+        self._approval_requesters.pop(approval_key, None)
         # Resolve FIRST (unblocks the agent); render after so a click past the
         # timeout (count == 0) shows "expired", not "approved".
         try:
