@@ -12,7 +12,8 @@ SLACK_LONG_DESCRIPTION_MAX_CHARACTERS = 4000
 
 def _build_full_manifest(
     bot_name: str, bot_description: str, include_assistant: bool = True,
-    messaging_experience: str | None = None, long_description: str | None = None) -> dict:
+    messaging_experience: str | None = None, long_description: str | None = None,
+    slash_command_name: str | None = None) -> dict:
     """Build a full Slack manifest: display info + slash list from ``COMMAND_REGISTRY``.
 
     Other sections (OAuth scopes, socket mode) are sensible Hermes defaults, tweakable in the Slack
@@ -31,7 +32,8 @@ def _build_full_manifest(
             "messages_tab_enabled": True,
             "messages_tab_read_only_enabled": False},
         "bot_user": {"display_name": bot_name[:80], "always_online": True},
-        "slash_commands": slack_app_manifest()["features"]["slash_commands"]}
+        "slash_commands": slack_app_manifest(
+            slash_command_name=slash_command_name)["features"]["slash_commands"]}
 
     bot_scopes = [
         "app_mentions:read", "channels:history", "channels:read", "chat:write", "commands",
@@ -88,6 +90,23 @@ def slack_manifest_command(args) -> int:
         print(f"hermes slack manifest: {msg}", file=sys.stderr)
         return 2
 
+    from hermes_constants import get_hermes_home
+    from hermes_cli.commands_platforms import slack_profile_command_name
+    from utils import fast_safe_load
+    config_path = Path(get_hermes_home()) / "config.yaml"
+    try:
+        with config_path.open(encoding="utf-8") as handle:
+            config = fast_safe_load(handle) or {}
+        platforms = config.get("platforms") or {}
+        slack = platforms.get("slack") or {}
+        extra = slack.get("extra") or {}
+        slash_command_name = slack_profile_command_name(
+            extra.get("slash_command_name"))
+    except FileNotFoundError:
+        slash_command_name = ""
+    except (OSError, ValueError, AttributeError) as exc:
+        return fail(str(exc))
+
     if slashes_only and (long_description is not None or long_description_file is not None):
         return fail("long description options cannot be used with --slashes-only")
     if long_description_file is not None:
@@ -115,11 +134,13 @@ def slack_manifest_command(args) -> int:
 
     if slashes_only:
         from hermes_cli.commands_platforms import slack_app_manifest
-        manifest = slack_app_manifest()["features"]["slash_commands"]
+        manifest = slack_app_manifest(
+            slash_command_name=slash_command_name)["features"]["slash_commands"]
     else:
         manifest = _build_full_manifest(
             name, description, messaging_experience=messaging_experience,
-            long_description=long_description)
+            long_description=long_description,
+            slash_command_name=slash_command_name)
     payload = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
     write_target = getattr(args, "write", None)

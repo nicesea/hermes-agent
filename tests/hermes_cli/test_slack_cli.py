@@ -76,6 +76,29 @@ class TestSlackManifestConsoleExitStatus:
 class TestSlackManifestArgparse:
     """Slack manifest messaging-experience flags wire through argparse."""
 
+    def test_profile_slash_name_generates_only_its_own_command(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n  slack:\n    extra:\n      slash_command_name: stat\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        assert slack_manifest_command(_parse_slack_args(["slack", "manifest"])) == 0
+        manifest = json.loads(capsys.readouterr().out)
+        assert [entry["command"] for entry in manifest["features"]["slash_commands"]] == [
+            "/stat"
+        ]
+        assert "commands" in manifest["oauth_config"]["scopes"]["bot"]
+
+        assert slack_manifest_command(
+            _parse_slack_args(["slack", "manifest", "--slashes-only"])
+        ) == 0
+        assert [entry["command"] for entry in json.loads(capsys.readouterr().out)] == [
+            "/stat"
+        ]
+
 
 
 

@@ -292,9 +292,13 @@ class TestSlackWorkspaceCollisionIsolation:
 class TestAppMentionHandler:
     """Verify that the app_mention event handler is registered."""
 
-    def test_app_mention_registered_on_connect(self):
+    @pytest.mark.parametrize("slash_name", [None, "stat"])
+    def test_app_mention_registered_on_connect(self, slash_name):
         """connect() should register message + assistant lifecycle handlers."""
-        config = PlatformConfig(enabled=True, token="xoxb-fake")
+        config = PlatformConfig(
+            enabled=True, token="xoxb-fake",
+            extra={"slash_command_name": slash_name} if slash_name else {},
+        )
         adapter = SlackAdapter(config)
 
         # Track which events get registered
@@ -372,10 +376,14 @@ class TestAppMentionHandler:
         import re as _re
 
         assert isinstance(slash_matcher, _re.Pattern)
-        for expected in ("/hermes", "/btw", "/stop", "/model", "/help"):
+        expected_commands = ("/stat",) if slash_name else (
+            "/hermes", "/btw", "/stop", "/model", "/help")
+        for expected in expected_commands:
             assert slash_matcher.match(
                 expected
             ), f"Slack slash regex does not match {expected}"
+        if slash_name:
+            assert not slash_matcher.match("/retry")
 
         # Catch-all generic matcher must be registered after the named handlers
         # so it does not shadow them. It fires for any event type not already
@@ -3248,6 +3256,17 @@ class TestUserNameResolution:
 
 class TestSlashCommands:
     """Test slash command routing."""
+
+    @pytest.mark.asyncio
+    async def test_profile_slash_routes_subcommand_to_own_gateway(self, adapter):
+        adapter.config.extra["slash_command_name"] = "stat"
+        command = {"command": "/stat", "text": "retry", "user_id": "U1",
+                   "channel_id": "D1", "team_id": "T1"}
+        await adapter._handle_slash_command(command)
+        event = adapter.handle_message.call_args.args[0]
+        assert event.text == "/retry"
+        assert event.source.chat_id == "D1"
+        assert event.source.scope_id == "T1"
 
     @pytest.mark.asyncio
     async def test_compact_maps_to_compress(self, adapter):

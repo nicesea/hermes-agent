@@ -305,6 +305,26 @@ For backward compatibility with older manifests, you can still type
 run the tests`. Free-form questions also work: `/hermes what's the
 weather?` is treated as a regular message.
 
+### Multiple Hermes apps in one Slack workspace
+
+Slack slash command names are workspace-wide, not scoped to the app conversation.
+If two apps register `/retry`, Slack sends it to the app that registered it most
+recently. Give each Hermes profile one distinct command instead:
+
+```yaml
+platforms:
+  slack:
+    extra:
+      slash_command_name: stat
+```
+
+With this setting, `hermes -p stat slack manifest --agent-view --write` declares
+only `/stat`, and the profile's gateway accepts `/stat retry`, `/stat help`, and
+other subcommands. Configure the other profile with its own name (for example,
+`mark`), update each app's manifest, and reinstall if Slack prompts. An app
+without this setting retains the default native commands. In a thread, use
+`!retry` as described below; Slack does not deliver native slashes from threads.
+
 ### Using commands inside threads (the `!cmd` prefix)
 
 Slack itself blocks native slash commands inside thread replies — try

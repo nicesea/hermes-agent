@@ -1669,11 +1669,13 @@ class SlackAdapter(BasePlatformAdapter):
                 "`hermes slack manifest`)",
                 (event or {}).get("type", (body or {}).get("event", {}).get("type", "unknown")))
 
-        # Every COMMAND_REGISTRY command is a native slash via one regex matcher. Commands must
-        # ALSO be declared in the app manifest (`hermes slack manifest`): Socket Mode won't
-        # deliver undeclared commands at all.
+        # Commands must also be declared in the app manifest: Socket Mode won't
+        # deliver undeclared commands. Profiles sharing a workspace use distinct
+        # slash names so Slack never routes one profile's command to another app.
         from hermes_cli.commands_platforms import slack_native_slashes
-        _slash_names = [name for name, _d, _h in slack_native_slashes()]
+        _profile_slash_name = self._profile_slash_name()
+        _slash_names = ([_profile_slash_name] if _profile_slash_name else
+                        [name for name, _d, _h in slack_native_slashes()])
         if _slash_names:
             _slash_pattern = re.compile(
                 r"^/(?:" + "|".join(re.escape(n) for n in _slash_names) + r")$")
@@ -5979,14 +5981,17 @@ class SlackAdapter(BasePlatformAdapter):
         finally:
             _slash_user_id.reset(_slash_user_id_token)
 
-    @staticmethod
-    def _slash_command_text(command: dict) -> str:
+    def _profile_slash_name(self) -> str:
+        from hermes_cli.commands_platforms import slack_profile_command_name
+        return slack_profile_command_name(self.config.extra.get("slash_command_name"))
+
+    def _slash_command_text(self, command: dict) -> str:
         """Gateway message text for a slash payload. Native slashes keep Slack's raw argument
         payload verbatim (internal/trailing spacing). ``/hermes`` (or a missing ``command``) maps
         ``<subcommand> [args]`` via the registry, else free-form text is a regular question."""
         slash_name = (command.get("command") or "").lstrip("/").strip()
         raw_text = str(command.get("text") or "")
-        if slash_name not in {"hermes", ""}:
+        if slash_name not in {"hermes", "", self._profile_slash_name()}:
             return f"/{slash_name}" if not raw_text else f"/{slash_name} {raw_text}"
         legacy_text = raw_text.strip()
         from hermes_cli.commands_platforms import slack_subcommand_map

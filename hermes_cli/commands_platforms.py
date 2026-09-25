@@ -390,6 +390,14 @@ def _sanitize_slack_name(raw: str) -> str:
     return _SLACK_INVALID_CHARS.sub("", raw.lower()).strip("-_")[:_SLACK_NAME_LIMIT]
 
 
+def slack_profile_command_name(value: Any) -> str:
+    """Validate an optional per-app slash name shared by the manifest and adapter."""
+    name = str(value or "").strip().lower()
+    if name and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+        raise ValueError("Slack slash_command_name must be a valid slash command name")
+    return name
+
+
 def slack_native_slashes() -> list[tuple[str, str, str]]:
     """(slash_name, description, usage_hint) triples for Slack: every gateway-available command
     (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
@@ -417,11 +425,19 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
 
 
 def slack_app_manifest(
-    request_url: str = "https://hermes-agent.local/slack/commands") -> dict[str, Any]:
+    request_url: str = "https://hermes-agent.local/slack/commands",
+    slash_command_name: str | None = None,
+) -> dict[str, Any]:
     """``features.slash_commands`` manifest portion only (decoupled from the rest of the manifest
     users configure in the Slack UI); ``request_url`` is schema-required, ignored in Socket Mode."""
     slashes = []
-    for name, desc, usage in slack_native_slashes():
+    profile_name = slack_profile_command_name(slash_command_name)
+    commands = (
+        [(profile_name, "Talk to this Hermes agent or run a subcommand",
+          "[subcommand] [args]")]
+        if profile_name else slack_native_slashes()
+    )
+    for name, desc, usage in commands:
         entry = {"command": f"/{name}", "description": desc or f"Run /{name}",
                  "should_escape": False, "url": request_url}
         if usage:
